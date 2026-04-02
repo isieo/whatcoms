@@ -1,0 +1,11 @@
+.wwebjs_auth
+.wwebjs_cache
+chat_cache.json
+node_modules
+models
+npm_out.txt
+package-lock.json
+.env
+start.bat
+npm_out.txt
+bun.lock
