@@ -11,6 +11,21 @@ const WHATSAPP_OWNER_ID = process.env.WHATSAPP_OWNER_ID;
 let WHATSAPP_OWNER_NAME = process.env.WHATSAPP_OWNER_NAME || "the owner";
 const CACHE_FILE = 'chat_cache.json';
 const LLAMA_PORT = 18642;
+const LLM_MODEL_SIZE = process.env.LLM_MODEL_SIZE || 'E4B';
+const GPU_LAYERS = process.env.GPU_LAYERS || '99';
+
+const MODELS_CONFIG = {
+    'E4B': {
+        repo: 'bartowski/google_gemma-4-E4B-it-GGUF',
+        model: 'google_gemma-4-E4B-it-Q4_K_M.gguf',
+        mmproj: 'mmproj-google_gemma-4-E4B-it-f16.gguf'
+    },
+    '26B': {
+        repo: 'unsloth/gemma-4-26B-A4B-it-GGUF',
+        model: 'gemma-4-26B-A4B-it-UD-IQ4_NL.gguf',
+        mmproj: 'mmproj-F16.gguf'
+    }
+};
 
 const getCleanNumber = (id) => {
     if (!id) return '';
@@ -27,11 +42,15 @@ async function downloadFile(url, dest) {
     console.log(`\nDownloading: ${path.basename(dest)}`);
     return new Promise((resolve, reject) => {
         const request = (sourceUrl) => {
-            https.get(sourceUrl, (response) => {
+            const options = {};
+            if (process.env.HF_TOKEN && sourceUrl.includes('huggingface.co')) {
+                options.headers = { 'Authorization': `Bearer ${process.env.HF_TOKEN}` };
+            }
+            https.get(sourceUrl, options, (response) => {
                 if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
                     return request(new URL(response.headers.location, sourceUrl).href);
                 }
-                if (response.statusCode !== 200) return reject(new Error(`HTTP ${response.statusCode}`));
+                if (response.statusCode !== 200) return reject(new Error(`HTTP ${response.statusCode} for ${sourceUrl}`));
                 const file = fs.createWriteStream(dest);
                 let downloaded = 0;
                 const total = parseInt(response.headers['content-length'] || 0, 10);
@@ -51,14 +70,14 @@ async function downloadFile(url, dest) {
 // ─── llama-server Helpers ───────────────────────────────────────────────────
 
 async function ensureLlamaServer() {
-    const serverPath = path.join(__dirname, 'models', 'llama-server.exe');
+    const release = 'b8642';
+    const serverPath = path.join(__dirname, 'models', `llama-server-${release}.exe`);
     if (fs.existsSync(serverPath) && fs.statSync(serverPath).size > 0) return serverPath;
 
-    const release = 'b8607';
     // Download Server Binary
     const binUrl = `https://github.com/ggml-org/llama.cpp/releases/download/${release}/llama-${release}-bin-win-cuda-12.4-x64.zip`;
     const binZip = path.join(__dirname, 'models', 'llama-server.zip');
-    
+
     // Download CUDA Runtime (DLLs)
     const dllUrl = `https://github.com/ggml-org/llama.cpp/releases/download/${release}/cudart-llama-bin-win-cuda-12.4-x64.zip`;
     const dllZip = path.join(__dirname, 'models', 'cudart.zip');
@@ -70,7 +89,7 @@ async function ensureLlamaServer() {
     const extractToModels = async (zip, name) => {
         const tempDir = path.join(__dirname, 'models', '_temp_' + name);
         if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
-        
+
         await new Promise((resolve, reject) => {
             const ps = spawn('powershell', [
                 '-Command',
@@ -99,9 +118,41 @@ async function ensureLlamaServer() {
 
     await extractToModels(binZip, 'server');
     await extractToModels(dllZip, 'dlls');
-    
+
+    // Rename to versioned binary for update tracking
+    const extractedServer = path.join(__dirname, 'models', 'llama-server.exe');
+    if (fs.existsSync(extractedServer)) {
+        fs.renameSync(extractedServer, serverPath);
+    }
+
     console.log('llama-server.exe and DLLs ready.');
     return serverPath;
+}
+
+async function ensureGemma4Models() {
+    const config = MODELS_CONFIG[LLM_MODEL_SIZE] || MODELS_CONFIG['E4B'];
+    const modelDir = path.join(__dirname, 'models');
+    if (!fs.existsSync(modelDir)) fs.mkdirSync(modelDir, { recursive: true });
+
+    const modelName = config.model;
+    const mmprojName = config.mmproj;
+
+    const modelPath = path.join(modelDir, modelName);
+    const mmprojPath = path.join(modelDir, mmprojName);
+
+    const baseUrl = `https://huggingface.co/${config.repo}/resolve/main/`;
+
+    if (!fs.existsSync(modelPath) || fs.statSync(modelPath).size < 1000000) {
+        console.log(`Downloading Gemma 4 ${LLM_MODEL_SIZE} Model: ${modelName}...`);
+        await downloadFile(baseUrl + modelName, modelPath);
+    }
+
+    if (!fs.existsSync(mmprojPath) || fs.statSync(mmprojPath).size < 1000000) {
+        console.log(`Downloading Gemma 4 ${LLM_MODEL_SIZE} Vision Projector: ${mmprojName}...`);
+        await downloadFile(baseUrl + mmprojName, mmprojPath);
+    }
+
+    return { modelPath, mmprojPath };
 }
 
 async function waitForServer(port, timeoutMs = 60000) {
@@ -256,14 +307,14 @@ client.on('message_create', async (msg) => {
         fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2));
 
         // ── Spawn llama-server ─────────────────────────────────────────
-        const modelPath = path.join(__dirname, 'models', 'Qwen_Qwen3-VL-8B-Instruct-Q4_K_M.gguf');
-        const mmprojPath = path.join(__dirname, 'models', 'mmproj-Qwen3VL-8B-Instruct-F16.gguf');
+        // ── Ensure Models & llama-server ───────────────────────────────
+        const { modelPath, mmprojPath } = await ensureGemma4Models();
         const serverBin = await ensureLlamaServer();
 
         const serverArgs = [
             '-m', modelPath,
             '--mmproj', mmprojPath,
-            '-ngl', '99',          // offload all layers to GPU
+            '-ngl', GPU_LAYERS,          // offload layers to GPU
             '--port', String(LLAMA_PORT),
             '--ctx-size', '16384',
             '--no-mmap',
